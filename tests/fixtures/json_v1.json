@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "url": "https://example.test/",
+  "ok": true,
+  "exit_code": 0,
+  "response": {
+    "status_line": "HTTP/2 200",
+    "status_code": 200,
+    "remote_ip": "192.0.2.1",
+    "remote_port": "443",
+    "headers": {
+      "Content-Type": "application/json"
+    }
+  },
+  "timings_ms": {
+    "dns": 5,
+    "connect": 10,
+    "tls": 15,
+    "server": 50,
+    "transfer": 20,
+    "total": 100,
+    "namelookup": 5,
+    "initial_connect": 15,
+    "pretransfer": 30,
+    "starttransfer": 80
+  },
+  "speed": {
+    "download_kbs": 2.0,
+    "upload_kbs": 0.0
+  },
+  "slo": null
+}

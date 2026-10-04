@@ -1,0 +1,30 @@
+schema_version = 1
+concurrency = 4
+
+[defaults]
+repeat = 5
+warmup = 1
+timeout = 10
+expect_status = ["200-299"]
+
+[policies]
+min_success_rate = 100
+max_failures = 0
+
+[[requests]]
+name = "health"
+url = "https://api.example.com/health"
+method = "GET"
+headers = ["Accept: application/json"]
+expect_body_contains = ["healthy"]
+slo = "total=500,ttfb=300"
+
+[[requests]]
+name = "create-item"
+url = "https://api.example.com/items"
+method = "POST"
+headers = ["Content-Type: application/json"]
+body = '{"name":"example"}'
+expect_status = ["201"]
+repeat = 3
+fail_if = ["p95.total > 750ms"]

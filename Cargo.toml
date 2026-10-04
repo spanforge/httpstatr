@@ -1,0 +1,45 @@
+[package]
+name = "httpstatr"
+version = "1.0.0-rc.1"
+edition = "2024"
+rust-version = "1.85"
+description = "HTTP timing diagnostics, assertions, regression gates, and historical analysis powered by curl"
+license = "MIT"
+repository = "https://github.com/spanforge/httpstatr"
+readme = "README.md"
+keywords = ["curl", "http", "performance", "diagnostics", "cli"]
+categories = ["command-line-utilities", "development-tools::testing"]
+publish = ["crates-io"]
+include = [
+    "src/**",
+    "tests/**",
+    "docs/**",
+    "examples/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE",
+    "NOTICE",
+]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.12"
+toml = "0.9"
+clap_complete = "4.6"
+clap_mangen = "0.2"
+ctrlc = "3.5"
+
+[[bin]]
+name = "httpstatr"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
