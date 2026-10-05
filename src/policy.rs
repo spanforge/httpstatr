@@ -64,6 +64,13 @@ pub struct Expectations {
     max_body_bytes: Option<u64>,
     body_contains: Vec<String>,
     body_regexes: Vec<(String, Regex)>,
+    json: Vec<(String, JsonExpectation)>,
+}
+
+#[derive(Debug)]
+enum JsonExpectation {
+    Equal(serde_json::Value),
+    Type(String),
 }
 
 #[derive(Debug)]
@@ -159,11 +166,76 @@ impl Expectations {
             max_body_bytes,
             body_contains: body_contains.to_vec(),
             body_regexes: parsed_regexes,
+            json: Vec::new(),
         }))
     }
 
+    pub fn parse_with_json(
+        statuses: &[String],
+        headers: &[String],
+        min_body_bytes: Option<u64>,
+        max_body_bytes: Option<u64>,
+        body_contains: &[String],
+        body_regexes: &[String],
+        json: &[String],
+    ) -> Result<Option<Self>, AppError> {
+        let existing = Self::parse(
+            statuses,
+            headers,
+            min_body_bytes,
+            max_body_bytes,
+            body_contains,
+            body_regexes,
+        )?;
+        if json.is_empty() {
+            return Ok(existing);
+        }
+        let mut expectations = existing.unwrap_or(Self {
+            statuses: Vec::new(),
+            headers: Vec::new(),
+            min_body_bytes,
+            max_body_bytes,
+            body_contains: Vec::new(),
+            body_regexes: Vec::new(),
+            json: Vec::new(),
+        });
+        for spec in json {
+            let (pointer, expected) = spec.split_once('=').ok_or_else(|| {
+                AppError::local("JSON assertion requires POINTER=JSON or POINTER:type=TYPE")
+            })?;
+            let (pointer, expectation) = if let Some(pointer) = pointer.strip_suffix(":type") {
+                if !["null", "boolean", "number", "string", "array", "object"].contains(&expected) {
+                    return Err(AppError::local(
+                        "JSON type must be null, boolean, number, string, array, or object",
+                    ));
+                }
+                (pointer, JsonExpectation::Type(expected.into()))
+            } else {
+                (
+                    pointer,
+                    JsonExpectation::Equal(serde_json::from_str(expected).map_err(|_| {
+                        AppError::local("JSON assertion expected value must be valid JSON")
+                    })?),
+                )
+            };
+            if !pointer.is_empty() && !pointer.starts_with('/') {
+                return Err(AppError::local(
+                    "JSON Pointer must be empty or start with /",
+                ));
+            }
+            let mut chars = pointer.chars();
+            while let Some(character) = chars.next() {
+                if character == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                    return Err(AppError::local("JSON Pointer escapes must be ~0 or ~1"));
+                }
+            }
+            expectations.json.push((pointer.into(), expectation));
+        }
+        Ok(Some(expectations))
+    }
+
     pub fn requires_body_content(&self) -> bool {
-        !self.body_contains.is_empty() || !self.body_regexes.is_empty()
+        !self.body_contains.is_empty() || !self.body_regexes.is_empty() || !self.json.is_empty()
     }
 
     pub fn check(
@@ -202,7 +274,7 @@ impl Expectations {
                     expected: expected.name.clone(),
                     actual: "<missing>".into(),
                 }),
-                (Some(actual), Some(value)) if actual != value => {
+                (Some(actual), Some(value)) if !actual.lines().any(|line| line == value) => {
                     failures.push(AssertionFailure {
                         kind: "header".into(),
                         expected: format!("{}: {value}", expected.name),
@@ -249,6 +321,41 @@ impl Expectations {
                 });
             }
         }
+        if !self.json.is_empty() {
+            let document = serde_json::from_str::<serde_json::Value>(body);
+            for (pointer, expected) in &self.json {
+                let actual = document
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.pointer(pointer));
+                let pass = actual.is_some_and(|actual| match expected {
+                    JsonExpectation::Equal(expected) => actual == expected,
+                    JsonExpectation::Type(kind) => match kind.as_str() {
+                        "null" => actual.is_null(),
+                        "boolean" => actual.is_boolean(),
+                        "number" => actual.is_number(),
+                        "string" => actual.is_string(),
+                        "array" => actual.is_array(),
+                        "object" => actual.is_object(),
+                        _ => false,
+                    },
+                });
+                if !pass {
+                    failures.push(AssertionFailure {
+                        kind: "json".into(),
+                        expected: format!("JSON assertion at pointer {pointer:?}"),
+                        actual: if document.is_err() {
+                            "<invalid JSON>"
+                        } else if actual.is_none() {
+                            "<missing>"
+                        } else {
+                            "<value or type mismatch>"
+                        }
+                        .into(),
+                    });
+                }
+            }
+        }
         AssertionSummary {
             pass: failures.is_empty(),
             failures,
@@ -275,6 +382,55 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn json_pointers_types_and_invalid_documents_are_checked() {
+        let expectations = Expectations::parse_with_json(
+            &[],
+            &[],
+            None,
+            None,
+            &[],
+            &[],
+            &[
+                "/a~1b/~0key=2".into(),
+                "/items:type=array".into(),
+                "/nothing:type=null".into(),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            expectations
+                .check(
+                    &response(200),
+                    0,
+                    Some(r#"{"a/b":{"~key":2},"items":[],"nothing":null}"#)
+                )
+                .pass
+        );
+        assert!(
+            !expectations
+                .check(&response(200), 0, Some("invalid-json"))
+                .pass
+        );
+        assert!(!expectations.check(&response(200), 0, Some("{}")).pass);
+        for assertion in ["path=2", "/a~2b=2", "/a:type=invalid", "/a=not-json"] {
+            assert!(
+                Expectations::parse_with_json(&[], &[], None, None, &[], &[], &[assertion.into()])
+                    .is_err()
+            );
+        }
+        let mut headers = response(200);
+        headers
+            .fields
+            .insert("X-Test".into(), "first\nsecond".into());
+        let expectations =
+            Expectations::parse(&[], &["x-test:second".into()], None, None, &[], &[])
+                .unwrap()
+                .unwrap();
+        assert!(expectations.check(&headers, 0, None).pass);
+    }
 
     fn response(status: u16) -> ResponseHeaders {
         ResponseHeaders {

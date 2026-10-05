@@ -13,7 +13,7 @@ pub fn render(result: &BatchResult) -> Result<String, AppError> {
         "log": {
             "version": "1.2",
             "creator": { "name": "httpstatr", "version": env!("CARGO_PKG_VERSION") },
-            "comment": "Synthetic timing export. Wall-clock start times and unavailable protocol fields are omitted.",
+            "comment": "Synthetic curl timing export. Unavailable request and protocol fields are represented as empty or unknown.",
             "entries": entries
         }
     })).map_err(|error| AppError::local(format!("could not serialize HAR: {error}")))
@@ -22,12 +22,22 @@ pub fn render(result: &BatchResult) -> Result<String, AppError> {
 fn entry(result: &BatchResult, sample: &BatchSample) -> Value {
     let timings = sample.timings_ms.as_ref();
     let response = sample.response.as_ref();
+    let http_version = sample
+        .connection
+        .as_ref()
+        .map_or_else(String::new, |value| {
+            if value.http_version.is_empty() {
+                String::new()
+            } else {
+                format!("HTTP/{}", value.http_version)
+            }
+        });
     json!({
         "comment": format!("httpstatr sample {}", sample.index),
         "startedDateTime": sample.started_at_unix_ms.map_or_else(|| "1970-01-01T00:00:00.000Z".to_string(), rfc3339_millis),
         "time": timings.map_or(0, |value| value.total),
-        "request": { "method": request_method(&result.configuration.curl_args), "url": result.url, "httpVersion": sample.connection.as_ref().map_or("", |value| value.http_version.as_str()), "headers": [], "queryString": [], "cookies": [], "headersSize": -1, "bodySize": -1 },
-        "response": { "status": response.map_or(0, |value| value.status_code), "statusText": response.map_or_else(String::new, |value| status_text(&value.status_line)), "httpVersion": sample.connection.as_ref().map_or("", |value| value.http_version.as_str()), "headers": response.map_or_else(Vec::new, |value| value.headers.iter().map(|(name, value)| json!({"name": name, "value": value})).collect()), "cookies": [], "content": {"size": sample.response_size_bytes.unwrap_or(0), "mimeType": ""}, "redirectURL": "", "headersSize": -1, "bodySize": sample.response_size_bytes.unwrap_or(0) },
+        "request": { "method": request_method(&result.configuration.curl_args), "url": result.url, "httpVersion": http_version, "headers": [], "queryString": [], "cookies": [], "headersSize": -1, "bodySize": -1 },
+        "response": { "status": response.map_or(0, |value| value.status_code), "statusText": response.map_or_else(String::new, |value| status_text(&value.status_line)), "httpVersion": http_version, "headers": response.map_or_else(Vec::new, |value| value.headers.iter().flat_map(|(name, value)| value.lines().map(move |value| json!({"name": name, "value": value}))).collect()), "cookies": [], "content": {"size": sample.response_size_bytes.unwrap_or(0), "mimeType": ""}, "redirectURL": "", "headersSize": -1, "bodySize": sample.response_size_bytes.unwrap_or(0) },
         "cache": {},
         "timings": har_timings(timings),
         "serverIPAddress": response.map_or("", |value| value.remote_ip.as_str()),
@@ -37,15 +47,48 @@ fn entry(result: &BatchResult, sample: &BatchSample) -> Value {
 
 fn har_timings(value: Option<&Timings>) -> Value {
     value.map_or_else(|| json!({"blocked": -1, "dns": -1, "connect": -1, "ssl": -1, "send": 0, "wait": -1, "receive": -1}), |value| json!({
-        "blocked": 0, "dns": value.dns, "connect": value.connect + value.tls,
+        "blocked": value.total.saturating_sub(value.dns + value.connect + value.tls + value.server + value.transfer), "dns": value.dns, "connect": value.connect + value.tls,
         "ssl": value.tls, "send": 0, "wait": value.server, "receive": value.transfer
     }))
 }
 
 fn request_method(args: &[String]) -> &str {
-    args.windows(2)
+    if let Some(method) = args
+        .windows(2)
         .find(|pair| pair[0] == "-X" || pair[0] == "--request")
-        .map_or("GET", |pair| pair[1].as_str())
+        .map(|pair| pair[1].as_str())
+    {
+        return method;
+    }
+    if let Some(method) = args.iter().find_map(|arg| {
+        arg.strip_prefix("--request=")
+            .or_else(|| arg.strip_prefix("-X").filter(|value| !value.is_empty()))
+    }) {
+        return method;
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-I" | "--head"))
+    {
+        return "HEAD";
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-G" | "--get"))
+    {
+        return "GET";
+    }
+    if args.iter().any(|arg| {
+        arg.starts_with("--data")
+            || arg.starts_with("-d")
+            || arg == "--json"
+            || arg.starts_with("--json=")
+            || arg == "--form"
+            || arg.starts_with("-F")
+    }) {
+        return "POST";
+    }
+    "GET"
 }
 
 fn status_text(status_line: &str) -> String {

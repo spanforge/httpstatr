@@ -91,10 +91,15 @@ Rust **1.85 or newer** is required only when building from source.
 
 ## Installation
 
-Install the release candidate with Cargo:
+Version **1.0.0 supports Windows x86-64**. Download the Windows ZIP or standalone
+`httpstatr.exe` from [GitHub Releases](https://github.com/spanforge/httpstatr/releases)
+and verify its hash against `SHA256SUMS`. Linux and macOS binaries are not
+published or supported in this release.
+
+After the stable crate is published, you can also install it with Cargo:
 
 ```console
-cargo install httpstatr --version 1.0.0-rc.1 --locked
+cargo install httpstatr --version 1.0.0 --locked
 ```
 
 Or build the repository:
@@ -103,25 +108,13 @@ Or build the repository:
 cargo build --release --locked
 ```
 
-The executable is written to `target/release/httpstatr` on Linux and macOS, or
-`target/release/httpstatr.exe` on Windows.
-
-Tagged releases contain archives for Linux x86-64, Windows x86-64, macOS
-x86-64, and Apple Silicon. Download an archive and `SHA256SUMS` from the
-[GitHub releases page](https://github.com/spanforge/httpstatr/releases), verify
-the checksum, and put the executable on `PATH`.
-
-```console
-# Linux or macOS
-sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf httpstatr-v1.0.0-rc.1-TARGET.tar.gz
-install httpstatr-v1.0.0-rc.1-TARGET/httpstatr ~/.local/bin/httpstatr
-```
+The Windows executable is written to `target/release/httpstatr.exe`.
+Extract the release ZIP and put the executable's directory on `PATH`.
 
 ```powershell
 # Windows: compare this hash with SHA256SUMS before extracting
-Get-FileHash .\httpstatr-v1.0.0-rc.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256
-Expand-Archive .\httpstatr-v1.0.0-rc.1-x86_64-pc-windows-msvc.zip
+Get-FileHash .\httpstatr-v1.0.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+Expand-Archive .\httpstatr-v1.0.0-x86_64-pc-windows-msvc.zip
 ```
 
 Verify the installation:
@@ -132,6 +125,25 @@ curl --version
 ```
 
 ## Quick start
+
+Check local prerequisites without making requests:
+
+```console
+httpstatr doctor
+```
+
+Validate a suite or assert a JSON field:
+
+```console
+httpstatr --file examples/httpstatr-suite.toml --validate
+httpstatr https://api.example.com/health --expect-json '/status="healthy"'
+```
+
+Requests default to a 10-second connect timeout, a 60-second total timeout, and
+a 64 MiB response download limit. Override them with `--connect-timeout`,
+`--timeout`, and `--max-download-bytes`. Use `--run-timeout` to bound the complete
+run, including warmups and delays. See [production readiness](docs/production-readiness.md)
+for release checks and operational limits.
 
 Measure one request:
 

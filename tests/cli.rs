@@ -66,6 +66,395 @@ fn run_suite_file(path: &PathBuf, args: &[&str]) -> Output {
 }
 
 #[test]
+fn download_limit_stops_oversized_response() {
+    let (url, handle) = server(Duration::ZERO);
+    let output = run(&url, &["--max-download-bytes", "5", "--format", "json"]);
+    handle.join().unwrap();
+    assert_eq!(output.status.code(), Some(63));
+}
+
+#[test]
+fn json_assertions_check_values_types_and_missing_fields() {
+    let (url, handle) = server(Duration::ZERO);
+    let output = run(
+        &url,
+        &[
+            "--expect-json",
+            "/ok=true",
+            "--expect-json",
+            "/ok:type=boolean",
+            "--format",
+            "json",
+        ],
+    );
+    handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (url, handle) = server(Duration::ZERO);
+    let output = run(
+        &url,
+        &[
+            "--expect-json",
+            "/missing=\"assertion-secret\"",
+            "--format",
+            "json",
+        ],
+    );
+    handle.join().unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("assertion-secret"));
+}
+
+#[test]
+fn doctor_reports_local_capabilities_without_printing_proxy_credentials() {
+    let output = Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+        .arg("doctor")
+        .env("HTTPS_PROXY", "http://user:doctor-secret@127.0.0.1:1")
+        .env_remove("CURL_CA_BUNDLE")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("HTTP supported"));
+    assert!(!text.contains("doctor-secret"));
+}
+
+fn tls_server(cert_path: &std::path::Path) -> (String, JoinHandle<()>) {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let certificate = include_bytes!("fixtures/localhost-cert.pem");
+    fs::write(cert_path, certificate).unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(certificate).unwrap()],
+            PrivateKeyDer::from_pem_slice(include_bytes!("fixtures/localhost-key.pem")).unwrap(),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let connection = rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap();
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+        let mut request = [0; 4096];
+        if stream.read(&mut request).is_ok() {
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.flush();
+        }
+    });
+    (format!("https://localhost:{}/", address.port()), handle)
+}
+
+#[test]
+fn https_validates_certificates_and_exports_tls_timings() {
+    let directory = tempfile::tempdir().unwrap();
+    let certificate = directory.path().join("server.pem");
+    let (url, handle) = tls_server(&certificate);
+    let output = run(
+        &url,
+        &[
+            "--cacert",
+            certificate.to_str().unwrap(),
+            "--noproxy",
+            "*",
+            "--format",
+            "json",
+        ],
+    );
+    handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["response"]["status_code"], 200);
+    assert!(
+        result["timings_ms"]["tls"].as_u64().unwrap()
+            <= result["timings_ms"]["pretransfer"].as_u64().unwrap()
+    );
+    let (url, handle) = tls_server(&certificate);
+    let output = run(&url, &["--noproxy", "*", "--format", "json"]);
+    handle.join().unwrap();
+    assert_eq!(output.status.code(), Some(60));
+}
+
+#[test]
+fn explicit_http_proxy_is_forwarded_and_headers_are_measured() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        let size = stream.read(&mut request).unwrap();
+        assert!(
+            String::from_utf8_lossy(&request[..size])
+                .starts_with("GET http://example.test/health HTTP/1.1")
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let output = run(
+        "http://example.test/health",
+        &[
+            "--proxy",
+            &proxy,
+            "--noproxy",
+            "",
+            "--expect-status",
+            "200",
+            "--format",
+            "json",
+        ],
+    );
+    handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn exported_junit_is_well_formed_and_har_timings_are_consistent() {
+    let (url, handle) = server(Duration::ZERO);
+    let output = run(&url, &["--format", "junit"]);
+    handle.join().unwrap();
+    assert!(output.status.success());
+    let mut reader = quick_xml::Reader::from_reader(output.stdout.as_slice());
+    let mut depth = 0;
+    loop {
+        match reader.read_event().unwrap() {
+            quick_xml::events::Event::Start(element) => {
+                for attribute in element.attributes() {
+                    attribute.unwrap();
+                }
+                depth += 1;
+            }
+            quick_xml::events::Event::End(_) => depth -= 1,
+            quick_xml::events::Event::Eof => break,
+            _ => {}
+        }
+    }
+    assert_eq!(depth, 0);
+    let (url, handle) = server(Duration::ZERO);
+    let output = run(&url, &["--format", "har"]);
+    handle.join().unwrap();
+    assert!(output.status.success());
+    let har: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = &har["log"]["entries"][0];
+    assert_eq!(entry["request"]["httpVersion"], "HTTP/1.1");
+    let times = &entry["timings"];
+    let sum: u64 = ["blocked", "dns", "connect", "send", "wait", "receive"]
+        .iter()
+        .map(|key| times[key].as_u64().unwrap())
+        .sum();
+    assert_eq!(sum, entry["time"].as_u64().unwrap());
+}
+
+#[test]
+fn suite_profiles_resolve_urls_and_environment_secrets() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("suite.toml");
+    let (url, handle) = server(Duration::ZERO);
+    fs::write(&path, format!("schema_version=1\n[profiles.staging]\nBASE_URL='{url}'\n[[requests]]\nname='health'\nurl='${{BASE_URL}}'\nheaders=['Authorization: Bearer ${{env:HTTPSTATR_TEST_TOKEN}}']\nexpect_json=['/ok=true']\n")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+        .args([
+            "--file",
+            path.to_str().unwrap(),
+            "--profile",
+            "staging",
+            "--format",
+            "json",
+        ])
+        .env("HTTPSTATR_TEST_TOKEN", "profile-secret")
+        .output()
+        .unwrap();
+    handle.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("profile-secret"));
+    let output = Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+        .args([
+            "--file",
+            path.to_str().unwrap(),
+            "--profile",
+            "staging",
+            "--validate",
+        ])
+        .env_remove("HTTPSTATR_TEST_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("HTTPSTATR_TEST_TOKEN"));
+}
+
+#[test]
+fn whole_run_deadline_preserves_completed_samples_and_skips_delay() {
+    let (url, handle) = server(Duration::ZERO);
+    let started = std::time::Instant::now();
+    let output = run(
+        &url,
+        &[
+            "--repeat",
+            "3",
+            "--delay",
+            "10",
+            "--run-timeout",
+            "0.5",
+            "--format",
+            "json",
+        ],
+    );
+    handle.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(output.status.code(), Some(6));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["summary"]["transport_successful"], 1);
+    assert_eq!(result["samples"][1]["exit_code"], 28);
+}
+
+#[test]
+fn suite_validation_needs_no_curl_or_network_and_checks_all_policies() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("suite.toml");
+    fs::write(&path, "schema_version=1\n[[requests]]\nname='health'\nurl='http://127.0.0.1:1/'\nexpect_status=['200']\n").unwrap();
+    let output = run_suite_file(&path, &["--validate", "--curl-bin", "does-not-exist"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&path, "schema_version=1\n[[requests]]\nname='health'\nurl='http://127.0.0.1:1/'\nexpect_body_regex=['[']\n").unwrap();
+    assert!(!run_suite_file(&path, &["--validate"]).status.success());
+}
+
+#[test]
+fn concurrent_history_writes_and_interrupted_replacement_are_safe() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.jsonl");
+    let (url, handle) = server_n(Duration::ZERO, 6);
+    let mut children = Vec::new();
+    for _ in 0..6 {
+        children.push(
+            Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+                .arg(&url)
+                .args(["--history", path.to_str().unwrap(), "--format", "json"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+    handle.join().unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 6);
+    for line in text.lines() {
+        assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
+    }
+    let backup = directory.path().join("history.jsonl.bak");
+    fs::rename(&path, &backup).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+        .args([
+            "history",
+            "--history",
+            path.to_str().unwrap(),
+            "prune",
+            "--keep",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!backup.exists());
+    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+    let output = Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+        .args([
+            "history",
+            "--history",
+            path.to_str().unwrap(),
+            "export",
+            "--output",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn history_import_redacts_credentials_and_rejects_invalid_sources_before_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.jsonl");
+    let destination = directory.path().join("destination.jsonl");
+    let (url, handle) = server(Duration::ZERO);
+    assert!(
+        run(
+            &url,
+            &["--history", source.to_str().unwrap(), "--format", "json"]
+        )
+        .status
+        .success()
+    );
+    handle.join().unwrap();
+    let mut record: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&source).unwrap().trim()).unwrap();
+    record["result"]["url"] = serde_json::json!("https://example.test/?token=import-secret");
+    record["result"]["configuration"]["curl_args"] = serde_json::json!(["-uuser:import-password"]);
+    record["result"]["samples"][0]["response"]["headers"]["Authorization"] =
+        serde_json::json!("Bearer import-header");
+    let text = format!("{}\n", serde_json::to_string(&record).unwrap());
+    fs::write(&source, format!("{text}invalid-record\n")).unwrap();
+    let import = || {
+        Command::new(env!("CARGO_BIN_EXE_httpstatr"))
+            .args([
+                "history",
+                "--history",
+                destination.to_str().unwrap(),
+                "import",
+                source.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(!import().status.success());
+    assert!(!destination.exists());
+    fs::write(&source, &text).unwrap();
+    assert!(import().status.success());
+    let result = fs::read_to_string(&destination).unwrap();
+    for secret in ["import-secret", "import-password", "import-header"] {
+        assert!(!result.contains(secret));
+    }
+    fs::write(&destination, "incomplete").unwrap();
+    assert!(!import().status.success());
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "incomplete");
+}
+
+#[test]
 fn emits_json_and_passes_assertions() {
     let (url, handle) = server(Duration::ZERO);
     let output = run(

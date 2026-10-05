@@ -14,7 +14,13 @@ const SENSITIVE_HEADERS: &[&str] = &[
 ];
 
 pub fn is_sensitive_header(name: &str) -> bool {
-    SENSITIVE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+    let name = name.trim().to_ascii_lowercase();
+    SENSITIVE_HEADERS.contains(&name.as_str())
+        || name.contains("token")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("api-key")
+        || name.contains("apikey")
 }
 
 pub fn redact_url(url: &str) -> String {
@@ -63,7 +69,11 @@ fn redact_query(url: &str) -> String {
 }
 
 fn is_sensitive_query_parameter(name: &str) -> bool {
-    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+    let decoded = url::form_urlencoded::parse(format!("{name}=").as_bytes())
+        .next()
+        .map(|(name, _)| name.into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let normalized = decoded.trim().to_ascii_lowercase().replace('-', "_");
     normalized.contains("token")
         || normalized.contains("secret")
         || normalized.contains("password")
@@ -113,6 +123,9 @@ pub fn redact_display_headers(text: &str) -> String {
 pub fn redact_assertions(summary: &AssertionSummary) -> AssertionSummary {
     let mut redacted = summary.clone();
     for failure in &mut redacted.failures {
+        if matches!(failure.kind.as_str(), "body_contains" | "body_regex") {
+            failure.expected = "<redacted>".into();
+        }
         if failure.kind != "header" {
             continue;
         }
@@ -129,7 +142,7 @@ pub fn redact_command(url: &str, args: &[String]) -> Vec<String> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if matches!(arg.as_str(), "-H" | "--header") && index + 1 < args.len() {
+        if matches!(arg.as_str(), "-H" | "--header" | "--proxy-header") && index + 1 < args.len() {
             output.push(arg.clone());
             output.push(redact_header_line(&args[index + 1]));
             index += 2;
@@ -139,6 +152,7 @@ pub fn redact_command(url: &str, args: &[String]) -> Vec<String> {
             arg.as_str(),
             "-u" | "--user"
                 | "--proxy-user"
+                | "-U"
                 | "--oauth2-bearer"
                 | "-b"
                 | "--cookie"
@@ -147,6 +161,7 @@ pub fn redact_command(url: &str, args: &[String]) -> Vec<String> {
                 | "--data-raw"
                 | "--data-binary"
                 | "--data-urlencode"
+                | "--json"
         ) && index + 1 < args.len()
         {
             output.push(arg.clone());
@@ -154,7 +169,9 @@ pub fn redact_command(url: &str, args: &[String]) -> Vec<String> {
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--header=") {
+        if let Some(value) = arg.strip_prefix("--proxy-header=") {
+            output.push(format!("--proxy-header={}", redact_header_line(value)));
+        } else if let Some(value) = arg.strip_prefix("--header=") {
             output.push(format!("--header={}", redact_header_line(value)));
         } else if let Some(value) = arg.strip_prefix("-H") {
             output.push(format!("-H{}", redact_header_line(value)));
@@ -162,6 +179,10 @@ pub fn redact_command(url: &str, args: &[String]) -> Vec<String> {
             output.push("-d<redacted>".to_string());
         } else if arg.starts_with("-b") && arg.len() > 2 {
             output.push("-b<redacted>".to_string());
+        } else if arg.starts_with("-u") && arg.len() > 2 {
+            output.push("-u<redacted>".to_string());
+        } else if arg.starts_with("-U") && arg.len() > 2 {
+            output.push("-U<redacted>".to_string());
         } else if [
             "--user=",
             "--proxy-user=",
@@ -171,6 +192,7 @@ pub fn redact_command(url: &str, args: &[String]) -> Vec<String> {
             "--data-raw=",
             "--data-binary=",
             "--data-urlencode=",
+            "--json=",
         ]
         .iter()
         .any(|prefix| arg.starts_with(prefix))
@@ -225,7 +247,7 @@ fn collect_secret_values(url: &str, args: &[String]) -> Vec<String> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if matches!(arg.as_str(), "-H" | "--header") && index + 1 < args.len() {
+        if matches!(arg.as_str(), "-H" | "--header" | "--proxy-header") && index + 1 < args.len() {
             if let Some((name, value)) = args[index + 1].split_once(':') {
                 if is_sensitive_header(name) {
                     values.push(value.trim().to_string());
@@ -238,6 +260,7 @@ fn collect_secret_values(url: &str, args: &[String]) -> Vec<String> {
             arg.as_str(),
             "-u" | "--user"
                 | "--proxy-user"
+                | "-U"
                 | "--oauth2-bearer"
                 | "-b"
                 | "--cookie"
@@ -246,6 +269,7 @@ fn collect_secret_values(url: &str, args: &[String]) -> Vec<String> {
                 | "--data-raw"
                 | "--data-binary"
                 | "--data-urlencode"
+                | "--json"
         ) && index + 1 < args.len()
         {
             values.push(args[index + 1].clone());
@@ -263,11 +287,27 @@ fn collect_secret_values(url: &str, args: &[String]) -> Vec<String> {
                     | "--data-raw"
                     | "--data-binary"
                     | "--data-urlencode"
+                    | "--json"
             )
         });
-        if let Some((_, value)) = sensitive_assignment {
+        if let Some(header) = arg
+            .strip_prefix("--header=")
+            .or_else(|| arg.strip_prefix("--proxy-header="))
+            .or_else(|| arg.strip_prefix("-H").filter(|value| !value.is_empty()))
+        {
+            if let Some((name, value)) = header.split_once(':') {
+                if is_sensitive_header(name) {
+                    values.push(value.trim().to_string());
+                }
+            }
+        } else if let Some((_, value)) = sensitive_assignment {
             values.push(value.to_string());
-        } else if (arg.starts_with("-d") || arg.starts_with("-b")) && arg.len() > 2 {
+        } else if (arg.starts_with("-d")
+            || arg.starts_with("-b")
+            || arg.starts_with("-u")
+            || arg.starts_with("-U"))
+            && arg.len() > 2
+        {
             values.push(arg[2..].to_string());
         }
         index += 1;
@@ -278,6 +318,33 @@ fn collect_secret_values(url: &str, args: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_attached_credentials_and_header_echoes() {
+        let args = vec![
+            "-uuser:attached-secret".into(),
+            "-Uproxy:proxy-secret".into(),
+            "-HAuthorization: Bearer header-secret".into(),
+            "--json={\"key\":\"json-secret\"}".into(),
+        ];
+        let command =
+            redact_command("https://example.test/?api%5Fkey=query-secret", &args).join(" ");
+        let text = redact_curl_text(
+            "user:attached-secret proxy:proxy-secret Bearer header-secret {\"key\":\"json-secret\"}",
+            "https://example.test",
+            &args,
+        );
+        for secret in [
+            "attached-secret",
+            "proxy-secret",
+            "header-secret",
+            "json-secret",
+            "query-secret",
+        ] {
+            assert!(!command.contains(secret));
+            assert!(!text.contains(secret));
+        }
+    }
 
     #[test]
     fn redacts_url_credentials() {

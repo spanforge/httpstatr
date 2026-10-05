@@ -4,6 +4,17 @@ Schema v3 is the current aggregate document. It is produced by repeated runs,
 warmups, comparisons, history, advanced reports, and endpoint-suite entries.
 An ordinary single request remains schema v1 for compatibility.
 
+Configuration includes additive `expect_json` metadata and an optional `context`
+object containing `tool_version`, `os`, `arch`, `sampling_method`,
+`max_download_bytes`, and `run_timeout_seconds`. JSON assertion values are
+redacted in configuration output. Older schema v2/v3 baselines without these
+fields remain readable. Timeout metadata reports effective defaults rather
+than null when the tool supplies a default.
+
+Repeated response header values remain string-valued for compatibility and
+are separated by newlines. TLS phase timing reflects curl's application
+handshake milestone rather than the full pretransfer preparation time.
+
 ## Top-level fields
 
 | Field | Type | Meaning |

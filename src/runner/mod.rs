@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::error::AppError;
 use crate::model::{Metrics, RedirectHop, ResponseHeaders};
 
-pub use curl::{CurlRunner, validate_installation};
+pub use curl::{CurlRunner, validate_installation, validate_installation_bounded};
 
 pub struct Request<'a> {
     pub url: &'a str,
@@ -13,6 +13,9 @@ pub struct Request<'a> {
     pub curl_bin: &'a str,
     pub connect_timeout: Option<f64>,
     pub timeout: Option<f64>,
+    pub canceled: &'a std::sync::atomic::AtomicBool,
+    pub deadline: Option<std::time::Instant>,
+    pub max_download_bytes: u64,
     pub debug: bool,
     pub show_secrets: bool,
 }

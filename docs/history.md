@@ -3,6 +3,18 @@
 History records aggregate measurements in a local append-only JSONL file. It is
 opt-in and supports one URL per invocation.
 
+Operations use an operating-system file lock to coordinate writers, imports,
+exports, and pruning. Listing and pruning scan the file and retain only the
+requested records; individual records are limited to 64 MiB. Prune and export
+stage and sync their output before replacing the destination atomically.
+Imports validate the entire source before appending and redact credential
+fields again. Import and export cannot overwrite their own source.
+
+An incomplete final line is rejected before appending. Preserve a backup and
+repair that tail deliberately; the tool does not silently discard records.
+Interrupted replacement backups are recovered while holding the lock. Local
+filesystem locking is assumed; validate shared network storage separately.
+
 For development teams, history provides lightweight evidence across commits,
 builds, or environments without requiring a metrics service. It can reveal
 when a latency shift first appeared and provide candidates for investigation;

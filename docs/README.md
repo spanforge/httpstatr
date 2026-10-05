@@ -1,7 +1,7 @@
 # httpstatr documentation
 
 This directory contains the complete user and maintainer documentation for
-`httpstatr` 1.0.0-rc.1.
+`httpstatr` 1.0.0, supported on Windows x86-64.
 
 ## User guides
 

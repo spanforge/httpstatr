@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use crate::error::AppError;
@@ -56,12 +55,7 @@ enum Target {
 }
 
 pub fn load_baseline(path: &Path) -> Result<BatchResult, AppError> {
-    let text = fs::read_to_string(path).map_err(|error| {
-        AppError::local(format!(
-            "could not read baseline {}: {error}",
-            path.display()
-        ))
-    })?;
+    let text = crate::storage::read_text(path, 67_108_864)?;
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         AppError::local(format!(
             "baseline {} is not valid JSON: {error}",
@@ -442,6 +436,8 @@ mod tests {
                 max_body_bytes: None,
                 expect_body_contains: Vec::new(),
                 expect_body_regex: Vec::new(),
+                expect_json: Vec::new(),
+                context: None,
                 comparison_baseline: None,
                 regression_rules: Vec::new(),
             },

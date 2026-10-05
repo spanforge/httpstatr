@@ -18,6 +18,7 @@ pub enum CompletionShell {
 }
 
 pub enum Action {
+    Doctor(String),
     Run(Box<Config>),
     History(HistoryCommand),
     Completion(CompletionShell),
@@ -130,6 +131,10 @@ struct Arguments {
     #[arg(long)]
     file: Option<PathBuf>,
 
+    /// Select variables from a named suite environment profile.
+    #[arg(long, requires = "file")]
+    profile: Option<String>,
+
     /// Maximum number of suite endpoints running concurrently.
     #[arg(long, value_parser = positive_integer)]
     concurrency: Option<usize>,
@@ -186,6 +191,18 @@ struct Arguments {
     #[arg(long, value_parser = positive_number)]
     timeout: Option<f64>,
 
+    /// Maximum response download size in bytes (default 64 MiB).
+    #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..))]
+    max_download_bytes: u64,
+
+    /// Maximum wall-clock duration of the whole run, in seconds.
+    #[arg(long, value_parser = positive_number)]
+    run_timeout: Option<f64>,
+
+    /// Validate a suite and its policies without making requests.
+    #[arg(long, requires = "file")]
+    validate: bool,
+
     /// curl executable path or command name.
     #[arg(long)]
     curl_bin: Option<String>,
@@ -230,6 +247,10 @@ struct Arguments {
     #[arg(long = "expect-body-regex")]
     expect_body_regex: Vec<String>,
 
+    /// JSON Pointer assertion: /path=JSON or /path:type=TYPE. Repeatable.
+    #[arg(long = "expect-json")]
+    expect_json: Vec<String>,
+
     /// Compare aggregate timings with a saved schema v2 baseline.
     #[arg(long)]
     compare: Option<PathBuf>,
@@ -266,6 +287,11 @@ pub struct Config {
     pub debug: bool,
     pub connect_timeout: Option<f64>,
     pub timeout: Option<f64>,
+    pub canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub deadline: Option<std::time::Instant>,
+    pub max_download_bytes: u64,
+    pub run_timeout: Option<f64>,
+    pub validate: bool,
     pub expect_status: Vec<String>,
     pub expect_header: Vec<String>,
     pub show_secrets: bool,
@@ -276,15 +302,35 @@ pub struct Config {
     pub max_body_bytes: Option<u64>,
     pub expect_body_contains: Vec<String>,
     pub expect_body_regex: Vec<String>,
+    pub expect_json: Vec<String>,
     pub compare: Option<PathBuf>,
     pub fail_if: Vec<String>,
     pub suite_file: Option<PathBuf>,
+    pub profile: Option<String>,
     pub concurrency: Option<usize>,
     pub suite_min_success_rate: Option<f64>,
     pub suite_max_failures: Option<usize>,
 }
 
 pub fn parse(raw: Vec<String>) -> Result<Action, AppError> {
+    if raw.first().is_some_and(|value| value == "doctor") {
+        #[derive(Parser)]
+        #[command(
+            name = "httpstatr doctor",
+            about = "Check local curl and runtime configuration without making requests"
+        )]
+        struct DoctorArguments {
+            #[arg(long)]
+            curl_bin: Option<String>,
+        }
+        let arguments = DoctorArguments::try_parse_from(
+            std::iter::once("httpstatr doctor".to_string()).chain(raw.into_iter().skip(1)),
+        )
+        .map_err(|e| AppError::new(e.to_string(), if e.use_stderr() { 2 } else { 0 }))?;
+        return Ok(Action::Doctor(
+            arguments.curl_bin.unwrap_or_else(default_curl_bin),
+        ));
+    }
     if raw.first().is_some_and(|value| value == "history") {
         let mut args = vec!["httpstatr history".to_string()];
         args.extend(raw.into_iter().skip(1));
@@ -383,19 +429,16 @@ pub fn parse(raw: Vec<String>) -> Result<Action, AppError> {
         show_ip: env_bool("HTTPSTAT_SHOW_IP", true)?,
         show_speed: env_bool("HTTPSTAT_SHOW_SPEED", false)?,
         save_body: env_bool("HTTPSTAT_SAVE_BODY", true)?,
-        curl_bin: arguments.curl_bin.unwrap_or_else(|| {
-            env::var("HTTPSTAT_CURL_BIN").unwrap_or_else(|_| {
-                if cfg!(windows) {
-                    "curl.exe".into()
-                } else {
-                    "curl".into()
-                }
-            })
-        }),
+        curl_bin: arguments.curl_bin.unwrap_or_else(default_curl_bin),
         curl_version: None,
         debug: env_bool("HTTPSTAT_DEBUG", false)?,
         connect_timeout: arguments.connect_timeout,
         timeout: arguments.timeout,
+        canceled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deadline: None,
+        max_download_bytes: arguments.max_download_bytes,
+        run_timeout: arguments.run_timeout,
+        validate: arguments.validate,
         expect_status: arguments.expect_status,
         expect_header: arguments.expect_header,
         show_secrets: arguments.show_secrets,
@@ -406,9 +449,11 @@ pub fn parse(raw: Vec<String>) -> Result<Action, AppError> {
         max_body_bytes: arguments.max_body_bytes,
         expect_body_contains: arguments.expect_body_contains,
         expect_body_regex: arguments.expect_body_regex,
+        expect_json: arguments.expect_json,
         compare: arguments.compare,
         fail_if: arguments.fail_if,
         suite_file: arguments.file,
+        profile: arguments.profile,
         concurrency: arguments.concurrency,
         suite_min_success_rate: arguments.suite_min_success_rate,
         suite_max_failures: arguments.suite_max_failures,
@@ -416,7 +461,20 @@ pub fn parse(raw: Vec<String>) -> Result<Action, AppError> {
 }
 
 pub fn help() -> String {
-    Arguments::command().render_long_help().to_string()
+    format!(
+        "{}\nOther commands: doctor, history\n",
+        Arguments::command().render_long_help()
+    )
+}
+
+fn default_curl_bin() -> String {
+    env::var("HTTPSTAT_CURL_BIN").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "curl.exe".into()
+        } else {
+            "curl".into()
+        }
+    })
 }
 
 pub fn command() -> clap::Command {
@@ -429,12 +487,28 @@ fn normalize(raw: Vec<String>) -> Result<Vec<String>, AppError> {
     let mut index = 0;
     while index < raw.len() {
         let arg = &raw[index];
+        if arg == "--" {
+            remaining.extend(raw[index + 1..].iter().cloned());
+            break;
+        }
+        if curl_option_takes_value(arg) {
+            remaining.push(arg.clone());
+            let value = raw
+                .get(index + 1)
+                .ok_or_else(|| AppError::new("curl option requires a value", 2))?;
+            remaining.push(value.clone());
+            index += 2;
+            continue;
+        }
         if matches!(arg.as_str(), "-h" | "--help" | "-V" | "--version") {
             tool_args.push(arg.clone());
             index += 1;
             continue;
         }
-        if matches!(arg.as_str(), "--show-secrets" | "--generate-man") {
+        if matches!(
+            arg.as_str(),
+            "--show-secrets" | "--generate-man" | "--validate"
+        ) {
             tool_args.push(arg.clone());
             index += 1;
             continue;
@@ -446,6 +520,8 @@ fn normalize(raw: Vec<String>) -> Result<Vec<String>, AppError> {
                 | "--save"
                 | "--connect-timeout"
                 | "--timeout"
+                | "--max-download-bytes"
+                | "--run-timeout"
                 | "--curl-bin"
                 | "--expect-status"
                 | "--expect-header"
@@ -456,9 +532,11 @@ fn normalize(raw: Vec<String>) -> Result<Vec<String>, AppError> {
                 | "--max-body-bytes"
                 | "--expect-body-contains"
                 | "--expect-body-regex"
+                | "--expect-json"
                 | "--compare"
                 | "--fail-if"
                 | "--file"
+                | "--profile"
                 | "--concurrency"
                 | "--suite-min-success-rate"
                 | "--suite-max-failures"
@@ -483,6 +561,8 @@ fn normalize(raw: Vec<String>) -> Result<Vec<String>, AppError> {
             "--save=",
             "--connect-timeout=",
             "--timeout=",
+            "--max-download-bytes=",
+            "--run-timeout=",
             "--curl-bin=",
             "--expect-status=",
             "--expect-header=",
@@ -493,9 +573,11 @@ fn normalize(raw: Vec<String>) -> Result<Vec<String>, AppError> {
             "--max-body-bytes=",
             "--expect-body-contains=",
             "--expect-body-regex=",
+            "--expect-json=",
             "--compare=",
             "--fail-if=",
             "--file=",
+            "--profile=",
             "--concurrency=",
             "--suite-min-success-rate=",
             "--suite-max-failures=",
@@ -527,10 +609,10 @@ fn positive_number(value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
         .map_err(|_| "must be a positive number".to_string())?;
-    if parsed.is_finite() && parsed > 0.0 {
+    if parsed.is_finite() && parsed > 0.0 && parsed <= 31_536_000.0 {
         Ok(parsed)
     } else {
-        Err("must be a positive number".to_string())
+        Err("must be positive and at most 31536000 seconds".to_string())
     }
 }
 
@@ -538,10 +620,10 @@ fn nonnegative_number(value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
         .map_err(|_| "must be a nonnegative number".to_string())?;
-    if parsed.is_finite() && parsed >= 0.0 {
+    if parsed.is_finite() && (0.0..=31_536_000.0).contains(&parsed) {
         Ok(parsed)
     } else {
-        Err("must be a nonnegative number".to_string())
+        Err("must be nonnegative and at most 31536000 seconds".to_string())
     }
 }
 
@@ -614,21 +696,192 @@ pub(crate) fn validate_curl_args(args: &[String]) -> Result<(), AppError> {
         "--silent",
         "-S",
         "--show-error",
+        "--config",
+        "-K",
+        "--next",
+        "-:",
+        "--parallel",
+        "-Z",
+        "--url",
+        "--remote-name",
+        "-O",
+        "--remote-name-all",
+        "--output-dir",
+        "--trace",
+        "--trace-ascii",
+        "--stderr",
+        "--max-time",
+        "-m",
+        "--max-filesize",
+        "--retry",
+        "--retry-all-errors",
+        "--no-disable",
+        "--no-globoff",
+        "--proto",
+        "--proto-redir",
     ];
-    for arg in args {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
         let name = arg.split('=').next().unwrap_or(arg);
-        if FORBIDDEN.contains(&name) {
-            return Err(AppError::local(format!(
-                "{name} is not allowed in extra curl arguments"
-            )));
+        if arg == "--" || arg.starts_with("http://") || arg.starts_with("https://") {
+            return Err(AppError::local(
+                "extra curl arguments cannot add another URL; use a suite for multiple endpoints",
+            ));
         }
+        let mut attached_reserved = false;
+        if arg.starts_with('-') && !arg.starts_with("--") {
+            for (position, option) in arg[1..].chars().enumerate() {
+                if "wDosSK:ZOm".contains(option) {
+                    attached_reserved = true;
+                    break;
+                }
+                // Value-taking options consume the rest of a short-option token.
+                if "HubdXAxUeTrECYyz".contains(option) {
+                    if position > 0 {
+                        attached_reserved = true;
+                    }
+                    break;
+                }
+            }
+        }
+        let reserved_abbreviation =
+            name.starts_with("--") && FORBIDDEN.iter().any(|option| option.starts_with(name));
+        if FORBIDDEN.contains(&name)
+            || attached_reserved
+            || reserved_abbreviation
+            || name.starts_with("--retry")
+            || name.starts_with("--parallel")
+        {
+            return Err(AppError::local(
+                "extra curl arguments must not override output, limits, configuration, or transfer mode; use separate value-taking short options",
+            ));
+        }
+        let takes_value = curl_option_takes_value(arg);
+        index += if takes_value { 2 } else { 1 };
     }
     Ok(())
+}
+
+fn curl_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-H" | "--header"
+            | "-u"
+            | "--user"
+            | "-U"
+            | "--proxy-user"
+            | "-d"
+            | "--data"
+            | "--data-raw"
+            | "--data-binary"
+            | "--data-urlencode"
+            | "--json"
+            | "-b"
+            | "--cookie"
+            | "--oauth2-bearer"
+            | "-X"
+            | "--request"
+            | "-A"
+            | "--user-agent"
+            | "-e"
+            | "--referer"
+            | "-x"
+            | "--proxy"
+            | "--cacert"
+            | "--capath"
+            | "-E"
+            | "--cert"
+            | "--key"
+            | "--resolve"
+            | "--connect-to"
+            | "-T"
+            | "--upload-file"
+            | "-F"
+            | "--form"
+            | "--form-string"
+            | "--interface"
+            | "--limit-rate"
+            | "--proxy-header"
+            | "--preproxy"
+            | "--doh-url"
+            | "--request-target"
+            | "--url-query"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_reserved_options_and_accepts_sensitive_values() {
+        for option in [
+            "-ofile",
+            "-w%{url}",
+            "-Dheaders",
+            "-sS",
+            "-Kconfig",
+            "--config=x",
+            "--next",
+            "--parallel",
+            "--url=x",
+            "--max-time=1",
+            "--trace=file",
+        ] {
+            assert!(validate_curl_args(&[option.into()]).is_err(), "{option}");
+        }
+        for args in [
+            vec!["-uuser:password"],
+            vec!["-XPOST"],
+            vec!["-H", "-sensitive"],
+            vec!["--data", "-some-data"],
+            vec!["-v", "-L"],
+        ] {
+            assert!(
+                validate_curl_args(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_secret_history_and_unrepresentable_durations() {
+        assert!(
+            parse(vec![
+                "https://example.test".into(),
+                "--history=h".into(),
+                "--show-secrets".into()
+            ])
+            .is_err()
+        );
+        assert!(positive_number("1e300").is_err());
+        assert!(nonnegative_number("1e300").is_err());
+    }
+
+    #[test]
+    fn curl_values_do_not_enable_tool_flags() {
+        let Action::Run(config) = parse(vec![
+            "https://example.test".into(),
+            "-d".into(),
+            "--show-secrets".into(),
+        ])
+        .unwrap() else {
+            panic!("expected request");
+        };
+        assert!(!config.show_secrets);
+        assert_eq!(config.curl_args, ["-d", "--show-secrets"]);
+        let Action::Run(config) = parse(vec![
+            "https://example.test".into(),
+            "--".into(),
+            "-H".into(),
+            "--timeout=secret".into(),
+        ])
+        .unwrap() else {
+            panic!("expected request");
+        };
+        assert_eq!(config.timeout, None);
+        assert_eq!(config.curl_args, ["-H", "--timeout=secret"]);
+    }
 
     #[test]
     fn extracts_tool_options_after_url() {

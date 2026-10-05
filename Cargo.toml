@@ -1,6 +1,6 @@
 [package]
 name = "httpstatr"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "HTTP timing diagnostics, assertions, regression gates, and historical analysis powered by curl"
@@ -33,6 +33,13 @@ toml = "0.9"
 clap_complete = "4.6"
 clap_mangen = "0.2"
 ctrlc = "3.5"
+fs2 = "0.4"
+url = "2.5"
+tempfile = "3.15"
+
+[dev-dependencies]
+quick-xml = "0.41"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [[bin]]
 name = "httpstatr"

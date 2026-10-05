@@ -1,6 +1,6 @@
 # Legacy aggregate result schema v2
 
-Schema v2 was the earlier repeated-run document. `httpstatr` 1.0.0-rc.1 emits
+Schema v2 was the earlier repeated-run document. `httpstatr` 1.0.0 emits
 schema v3 for aggregate work, but still deserializes schema v2 baselines for
 `--compare`. This reference exists for stored-result compatibility.
 

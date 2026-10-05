@@ -9,10 +9,12 @@ sure it advertises the `HTTP` protocol:
 curl --version
 ```
 
-Install the release candidate from crates.io:
+Version 1.0.0 supports Windows x86-64. Download the Windows ZIP or executable
+from GitHub Releases. After publication to crates.io, Cargo installation is
+also available:
 
 ```console
-cargo install httpstatr --version 1.0.0-rc.1 --locked
+cargo install httpstatr --version 1.0.0 --locked
 ```
 
 Rust 1.85 or newer is needed for this installation method. Prebuilt archives

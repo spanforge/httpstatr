@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct Metrics {
     pub time_namelookup: u64,
     pub time_connect: u64,
+    pub time_appconnect: u64,
     pub time_pretransfer: u64,
     pub time_starttransfer: u64,
     pub time_total: u64,
@@ -32,7 +33,7 @@ impl Metrics {
     }
 
     pub fn tls(&self) -> u64 {
-        self.time_pretransfer.saturating_sub(self.time_connect)
+        self.time_appconnect.saturating_sub(self.time_connect)
     }
 
     pub fn server(&self) -> u64 {
@@ -166,10 +167,24 @@ pub struct BatchConfiguration {
     pub expect_body_contains: Vec<String>,
     #[serde(default)]
     pub expect_body_regex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expect_json: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MeasurementContext>,
     #[serde(default)]
     pub comparison_baseline: Option<String>,
     #[serde(default)]
     pub regression_rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeasurementContext {
+    pub tool_version: String,
+    pub os: String,
+    pub arch: String,
+    pub sampling_method: String,
+    pub max_download_bytes: u64,
+    pub run_timeout_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -402,6 +417,7 @@ mod tests {
         let metrics = Metrics {
             time_namelookup: 5,
             time_connect: 15,
+            time_appconnect: 30,
             time_pretransfer: 30,
             time_starttransfer: 80,
             time_total: 100,

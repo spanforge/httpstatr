@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Security fixes are provided for the newest public release. During the release
-candidate period, fixes may be delivered in a later `1.0.0-rc.N` release.
+Security fixes are provided for the newest stable release. Version 1.0.0
+supports Windows x86-64. Earlier release candidates are superseded by 1.0.0.
 
 ## Reporting a vulnerability
 

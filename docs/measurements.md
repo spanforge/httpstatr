@@ -20,6 +20,16 @@ The delay is expressed in seconds and may be fractional. Every request uses a
 new curl process and connection. This provides independent end-to-end samples;
 it does not measure connection-pool performance.
 
+Aggregate configuration also records tool version, operating system, architecture,
+curl version, the sampling method, and effective request timeouts. Runs with fewer
+than 100 successful samples include a tail-percentile guidance diagnostic. This
+is sampling guidance, not a confidence interval or a policy failure.
+
+TLS phase timing uses `time_appconnect - time_connect`, clamped at zero for
+plain HTTP. Protocol preparation between handshake completion and pretransfer
+is not classified as TLS. Redirect timings remain cumulative curl measurements;
+the tool does not claim independent per-hop phase timings.
+
 Measured requests and warmups are each capped at 10,000. Warmup timings,
 warmup failures, and delays following warmups do not enter aggregate
 statistics. Warmup transport failures are counted separately.

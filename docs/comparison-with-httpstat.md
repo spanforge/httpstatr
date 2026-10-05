@@ -3,7 +3,7 @@
 `httpstatr` is a Rust rewrite and extension of
 [reorx/httpstat](https://github.com/reorx/httpstat). This comparison describes
 the original project's documented `master` behavior as checked on 2026-10-04
-and `httpstatr` 1.0.0-rc.1. The original project can evolve, so its README is
+and `httpstatr` 1.0.0. The original project can evolve, so its README is
 the authority for its current feature set.
 
 The goal of `httpstatr` is to retain the familiar curl timing workflow while
@@ -36,7 +36,7 @@ instead of a separate Rust HTTP implementation.
 
 ## Capability comparison
 
-| Capability | Original Python `httpstat` | `httpstatr` 1.0.0-rc.1 |
+| Capability | Original Python `httpstat` | `httpstatr` 1.0.0 |
 | --- | --- | --- |
 | Implementation | Single-file Python 3 script | Compiled Rust CLI |
 | External request engine | curl | curl 7.50.0 or newer, validated at startup |

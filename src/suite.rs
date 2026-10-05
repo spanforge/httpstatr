@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::fs;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,7 @@ pub struct RequestSettings {
     pub max_body_bytes: Option<u64>,
     pub expect_body_contains: Vec<String>,
     pub expect_body_regex: Vec<String>,
+    pub expect_json: Vec<String>,
     pub compare: Option<PathBuf>,
     pub fail_if: Vec<String>,
     pub curl_args: Vec<String>,
@@ -58,6 +58,8 @@ pub struct SuitePolicies {
 #[serde(deny_unknown_fields)]
 pub struct SuiteDefinition {
     pub schema_version: u8,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub concurrency: Option<usize>,
     #[serde(default)]
@@ -111,12 +113,32 @@ pub struct SuiteEndpointResult {
     pub error: Option<String>,
 }
 
-pub fn load(path: &Path) -> Result<SuiteDefinition, AppError> {
-    let text = fs::read_to_string(path).map_err(|error| {
-        AppError::local(format!("could not read suite {}: {error}", path.display()))
-    })?;
-    let suite: SuiteDefinition = toml::from_str(&text)
+pub fn load(path: &Path, profile: Option<&str>) -> Result<SuiteDefinition, AppError> {
+    let text = crate::storage::read_text(path, 4_194_304)?;
+    let mut suite: SuiteDefinition = toml::from_str(&text)
         .map_err(|error| AppError::local(format!("invalid suite {}: {error}", path.display())))?;
+    let variables = match profile {
+        Some(name) => suite
+            .profiles
+            .get(name)
+            .ok_or_else(|| AppError::local(format!("unknown suite profile {name:?}")))?
+            .clone(),
+        None => BTreeMap::new(),
+    };
+    resolve_settings(&mut suite.defaults, &variables)?;
+    for endpoint in &mut suite.requests {
+        endpoint.url = expand(&endpoint.url, &variables, 0)?;
+        if let Some(method) = &mut endpoint.method {
+            *method = expand(method, &variables, 0)?;
+        }
+        if let Some(body) = &mut endpoint.body {
+            *body = expand(body, &variables, 0)?;
+        }
+        for header in &mut endpoint.headers {
+            *header = expand(header, &variables, 0)?;
+        }
+        resolve_settings(&mut endpoint.settings, &variables)?;
+    }
     validate(&suite)?;
     Ok(suite)
 }
@@ -161,6 +183,11 @@ pub fn endpoint_config(
         debug: base.debug,
         connect_timeout: choose(&settings.connect_timeout, &defaults.connect_timeout).copied(),
         timeout: choose(&settings.timeout, &defaults.timeout).copied(),
+        canceled: base.canceled.clone(),
+        deadline: base.deadline,
+        max_download_bytes: base.max_download_bytes,
+        run_timeout: base.run_timeout,
+        validate: false,
         expect_status: merge(&defaults.expect_status, &settings.expect_status),
         expect_header: merge(&defaults.expect_header, &settings.expect_header),
         show_secrets: base.show_secrets,
@@ -174,13 +201,76 @@ pub fn endpoint_config(
             &settings.expect_body_contains,
         ),
         expect_body_regex: merge(&defaults.expect_body_regex, &settings.expect_body_regex),
+        expect_json: merge(&defaults.expect_json, &settings.expect_json),
         compare,
         fail_if: merge(&defaults.fail_if, &settings.fail_if),
         suite_file: None,
+        profile: base.profile.clone(),
         concurrency: None,
         suite_min_success_rate: None,
         suite_max_failures: None,
     }
+}
+
+fn resolve_settings(
+    settings: &mut RequestSettings,
+    variables: &BTreeMap<String, String>,
+) -> Result<(), AppError> {
+    if let Some(slo) = &mut settings.slo {
+        *slo = expand(slo, variables, 0)?;
+    }
+    for values in [
+        &mut settings.expect_status,
+        &mut settings.expect_header,
+        &mut settings.expect_body_contains,
+        &mut settings.expect_body_regex,
+        &mut settings.expect_json,
+        &mut settings.fail_if,
+        &mut settings.curl_args,
+    ] {
+        for value in values {
+            *value = expand(value, variables, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn expand(
+    text: &str,
+    variables: &BTreeMap<String, String>,
+    depth: usize,
+) -> Result<String, AppError> {
+    if depth > 8 {
+        return Err(AppError::local(
+            "suite profile variables contain a cycle or too many nested references",
+        ));
+    }
+    let mut output = String::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("${") {
+        output.push_str(&remaining[..start]);
+        let tail = &remaining[start + 2..];
+        let end = tail
+            .find('}')
+            .ok_or_else(|| AppError::local("unterminated suite variable reference"))?;
+        let name = &tail[..end];
+        let value = if let Some(variable) = name.strip_prefix("env:") {
+            std::env::var(variable).map_err(|_| {
+                AppError::local(format!(
+                    "required environment variable {variable:?} is missing or not Unicode"
+                ))
+            })?
+        } else {
+            let value = variables.get(name).ok_or_else(|| {
+                AppError::local(format!("undefined suite profile variable {name:?}"))
+            })?;
+            expand(value, variables, depth + 1)?
+        };
+        output.push_str(&value);
+        remaining = &tail[end + 1..];
+    }
+    output.push_str(remaining);
+    Ok(output)
 }
 
 pub fn effective_concurrency(cli: Option<usize>, suite: Option<usize>) -> Result<usize, AppError> {
@@ -243,6 +333,10 @@ fn validate(suite: &SuiteDefinition) -> Result<(), AppError> {
             "suite must contain at least one [[requests]] entry",
         ));
     }
+    if suite.requests.len() > 256 {
+        return Err(AppError::local("suite cannot exceed 256 endpoints"));
+    }
+    let mut total_requests = 0;
     validate_settings("defaults", &suite.defaults)?;
     if let Some(value) = suite.concurrency {
         effective_concurrency(None, Some(value))?;
@@ -274,6 +368,21 @@ fn validate(suite: &SuiteDefinition) -> Result<(), AppError> {
             )));
         }
         validate_settings(&format!("request {:?}", request.name), &request.settings)?;
+        total_requests += request
+            .settings
+            .repeat
+            .or(suite.defaults.repeat)
+            .unwrap_or(1)
+            + request
+                .settings
+                .warmup
+                .or(suite.defaults.warmup)
+                .unwrap_or(0);
+    }
+    if total_requests > 100_000 {
+        return Err(AppError::local(
+            "suite cannot exceed 100000 measured and warmup requests combined",
+        ));
     }
     Ok(())
 }
@@ -294,7 +403,7 @@ fn validate_settings(label: &str, settings: &RequestSettings) -> Result<(), AppE
     }
     if settings
         .delay
-        .is_some_and(|value| !value.is_finite() || value < 0.0)
+        .is_some_and(|value| !value.is_finite() || !(0.0..=31_536_000.0).contains(&value))
     {
         return Err(AppError::local(format!(
             "{label} delay must be a nonnegative number"
@@ -304,7 +413,7 @@ fn validate_settings(label: &str, settings: &RequestSettings) -> Result<(), AppE
         ("connect_timeout", settings.connect_timeout),
         ("timeout", settings.timeout),
     ] {
-        if value.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        if value.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 31_536_000.0) {
             return Err(AppError::local(format!(
                 "{label} {name} must be a positive number"
             )));

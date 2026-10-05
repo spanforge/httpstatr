@@ -8,7 +8,8 @@ httpstatr [OPTIONS] [URL] [CURL_ARGS]...
 
 Provide either a URL or `--file SUITE`, but not both. Options recognized by
 `httpstatr` are extracted wherever they appear; remaining arguments after the
-URL are forwarded to curl.
+URL are forwarded to curl. Known curl value-taking options keep their values
+literal. `--` stops extraction of tool options.
 
 ### General options
 
@@ -27,8 +28,10 @@ URL are forwarded to curl.
 
 | Option | Value | Description |
 | --- | --- | --- |
-| `--connect-timeout` | positive seconds | Set curl's connection timeout; decimals accepted. |
-| `--timeout` | positive seconds | Set curl's total operation timeout; decimals accepted. |
+| `--connect-timeout` | positive seconds | Connection timeout; default 10 seconds. |
+| `--timeout` | positive seconds | Total request timeout; default 60 seconds. |
+| `--run-timeout` | positive seconds | Whole-run deadline, including warmups and delays. |
+| `--max-download-bytes` | positive bytes | Response download limit; default 67108864 bytes. |
 | `--repeat` | `1..10000` | Number of measured requests; default `1`. |
 | `--warmup` | `0..10000` | Number of unmeasured warmups; default `0`. |
 | `--delay` | nonnegative seconds | Wait between requests; decimals accepted; default `0`. |
@@ -43,6 +46,7 @@ URL are forwarded to curl.
 | `--max-body-bytes` | bytes | Require no more than this response size. |
 | `--expect-body-contains` | text | Require body text; repeatable. |
 | `--expect-body-regex` | regex | Require a Rust regular-expression match; repeatable. |
+| `--expect-json` | `POINTER=JSON` or `POINTER:type=TYPE` | Assert a JSON field value or type; repeatable. |
 | `--slo` | comma-separated thresholds | Apply `total`, `connect`, `ttfb`, `dns`, or `tls` limits in milliseconds. |
 | `--compare` | path | Compare with a schema v2 or v3 aggregate baseline. |
 | `--fail-if` | expression | Apply an aggregate regression rule; repeatable. |
@@ -64,6 +68,8 @@ History recording supports one URL and cannot be combined with `--file` or
 | Option | Value | Description |
 | --- | --- | --- |
 | `--file` | TOML path | Run a versioned endpoint suite. |
+| `--validate` | | Check the suite without curl or network requests. |
+| `--profile` | name | Select suite variables from a named environment profile. |
 | `--concurrency` | `1..64` | Override maximum concurrent endpoints. |
 | `--suite-min-success-rate` | `0..100` | Override minimum endpoint pass percentage. |
 | `--suite-max-failures` | nonnegative integer | Override maximum failed endpoint count. |
@@ -82,7 +88,32 @@ These arguments and their long or `--option=value` forms are rejected:
 -o --output
 -s --silent
 -S --show-error
+-K --config
+-: --next
+-Z --parallel
+-O --remote-name
+-m --max-time
+--url --remote-name-all --output-dir --trace --trace-ascii --stderr
+--max-filesize --retry* --parallel* --no-disable --no-globoff
+--proto --proto-redir
 ```
+
+Attached reserved short options and reserved long-option abbreviations are
+also rejected. Use separate value-taking short options (for example `-v -u
+USER:PASSWORD`, rather than a combined token). Implicit curlrc loading and URL
+globbing are disabled so each request produces one measured transfer.
+Requests and followed redirects are restricted to HTTP and HTTPS.
+
+## Local diagnostics
+
+```console
+httpstatr doctor
+httpstatr doctor --curl-bin /path/to/curl
+```
+
+Checks curl capability, writable temporary storage, proxy configuration presence,
+and configured certificate paths without requests or exposed proxy credentials.
+This checks local setup, not remote certificate trust or endpoint availability.
 
 All other curl options are passed through. Consult `curl --help all` and your
 installed curl documentation for their semantics.

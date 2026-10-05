@@ -9,6 +9,7 @@ mod output;
 mod policy;
 mod redact;
 mod runner;
+mod storage;
 mod suite;
 
 use std::collections::VecDeque;
@@ -16,11 +17,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
+use std::sync::{Arc, Mutex, atomic::Ordering, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +64,15 @@ fn main() -> ExitCode {
         }
     };
     let config = match action {
+        Action::Doctor(curl_bin) => {
+            return match doctor(&curl_bin) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    ExitCode::from(error.code)
+                }
+            };
+        }
         Action::Run(config) => *config,
         Action::History(command) => {
             return match history::run(command) {
@@ -102,17 +108,34 @@ fn main() -> ExitCode {
 }
 
 fn run(mut config: Config) -> Result<u8, AppError> {
+    if !config.validate {
+        let signal = config.canceled.clone();
+        ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst)).map_err(|error| {
+            AppError::local(format!("could not install Ctrl-C handler: {error}"))
+        })?;
+        if let Some(seconds) = config.run_timeout {
+            let duration = Duration::try_from_secs_f64(seconds)
+                .map_err(|_| AppError::local("run timeout is too large"))?;
+            config.deadline = Some(
+                Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| AppError::local("run timeout is too large"))?,
+            );
+        }
+    }
     if config.suite_file.is_some() {
         return run_suite(config);
     }
+    validate_endpoint(&config)?;
     let slo = config.slo.as_deref().map(parse_slo).transpose()?;
-    let expectations = Expectations::parse(
+    let expectations = Expectations::parse_with_json(
         &config.expect_status,
         &config.expect_header,
         config.min_body_bytes,
         config.max_body_bytes,
         &config.expect_body_contains,
         &config.expect_body_regex,
+        &config.expect_json,
     )?;
     let baseline = config.compare.as_deref().map(load_baseline).transpose()?;
     let regression_rules = parse_rules(&config.fail_if, baseline.is_some())?;
@@ -199,6 +222,9 @@ fn execute_batch(
     let delay = Duration::from_secs_f64(config.delay);
     let mut warmup_failures = 0;
     for index in 0..config.warmup {
+        if stopped(config) {
+            break;
+        }
         match runner.execute(&request(config)) {
             Ok(output) => {
                 let _ = fs::remove_file(output.body_path);
@@ -211,7 +237,7 @@ fn execute_batch(
             }
         }
         if !delay.is_zero() {
-            thread::sleep(delay);
+            interruptible_delay(config, delay);
         }
     }
 
@@ -286,7 +312,7 @@ fn execute_batch(
             }
         }
         if index < config.repeat && !delay.is_zero() {
-            thread::sleep(delay);
+            interruptible_delay(config, delay);
         }
     }
     let elapsed = started.elapsed();
@@ -298,7 +324,9 @@ fn execute_batch(
     } else {
         0.0
     };
-    let base_exit_code = if transport_failures > 0 {
+    let base_exit_code = if config.canceled.load(Ordering::SeqCst) {
+        130
+    } else if transport_failures > 0 {
         PARTIAL_FAILURE_EXIT_CODE
     } else if assertion_failures > 0 {
         ASSERTION_EXIT_CODE
@@ -339,8 +367,8 @@ fn execute_batch(
             repeat: config.repeat,
             warmup: config.warmup,
             delay_seconds: config.delay,
-            connect_timeout_seconds: config.connect_timeout,
-            timeout_seconds: config.timeout,
+            connect_timeout_seconds: Some(config.connect_timeout.unwrap_or(10.0)),
+            timeout_seconds: Some(config.timeout.unwrap_or(60.0)),
             curl_args: display_curl_args,
             curl_version: config.curl_version.clone(),
             slo: config.slo.clone(),
@@ -350,6 +378,19 @@ fn execute_batch(
             max_body_bytes: config.max_body_bytes,
             expect_body_contains: config.expect_body_contains.clone(),
             expect_body_regex: config.expect_body_regex.clone(),
+            expect_json: config
+                .expect_json
+                .iter()
+                .map(|_| "<redacted>".into())
+                .collect(),
+            context: Some(model::MeasurementContext {
+                tool_version: env!("CARGO_PKG_VERSION").into(),
+                os: env::consts::OS.into(),
+                arch: env::consts::ARCH.into(),
+                sampling_method: "one curl process per sample".into(),
+                max_download_bytes: config.max_download_bytes,
+                run_timeout_seconds: config.run_timeout,
+            }),
             comparison_baseline: config
                 .compare
                 .as_ref()
@@ -488,13 +529,16 @@ fn evaluate(
     })
 }
 
-fn request<'a>(config: &'a Config) -> Request<'a> {
+fn request(config: &Config) -> Request<'_> {
     Request {
         url: &config.url,
         curl_args: &config.curl_args,
         curl_bin: &config.curl_bin,
         connect_timeout: config.connect_timeout,
         timeout: config.timeout,
+        canceled: &config.canceled,
+        deadline: config.deadline,
+        max_download_bytes: config.max_download_bytes,
         debug: config.debug,
         show_secrets: config.show_secrets,
     }
@@ -506,8 +550,7 @@ fn save_json(config: &Config, value: &impl serde::Serialize) -> Result<(), AppEr
     };
     let pretty = config.format != OutputFormat::Jsonl;
     let serialized = output::json::render(value, pretty)?;
-    fs::write(path, format!("{serialized}\n"))
-        .map_err(|error| AppError::local(format!("could not save {}: {error}", path.display())))
+    storage::atomic_write(path, &format!("{serialized}\n"))
 }
 
 fn log_config(config: &Config) {
@@ -540,7 +583,11 @@ fn unix_time_ms() -> Result<u64, AppError> {
 }
 
 fn configure_curl(config: &mut Config) -> Result<(), AppError> {
-    let runtime = runner::validate_installation(&config.curl_bin)?;
+    let runtime = runner::validate_installation_bounded(
+        &config.curl_bin,
+        config.deadline,
+        Some(&config.canceled),
+    )?;
     config.curl_version = Some(runtime.version);
     Ok(())
 }
@@ -593,7 +640,16 @@ fn run_suite(mut config: Config) -> Result<u8, AppError> {
         .as_ref()
         .ok_or_else(|| AppError::local("missing suite path"))?
         .clone();
-    let definition = suite::load(&suite_path)?;
+    let definition = suite::load(&suite_path, config.profile.as_deref())?;
+    for endpoint in &definition.requests {
+        let endpoint = suite::endpoint_config(&config, &suite_path, &definition.defaults, endpoint);
+        validate_endpoint(&endpoint)?;
+    }
+    if config.validate {
+        suite::effective_concurrency(config.concurrency, definition.concurrency)?;
+        println!("Suite is valid: {} endpoints", definition.requests.len());
+        return Ok(0);
+    }
     configure_curl(&mut config)?;
     let concurrency = suite::effective_concurrency(config.concurrency, definition.concurrency)?
         .min(definition.requests.len());
@@ -613,12 +669,7 @@ fn run_suite(mut config: Config) -> Result<u8, AppError> {
         })
         .collect();
     let jobs = Arc::new(Mutex::new(jobs));
-    let canceled = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&canceled);
-    ctrlc::set_handler(move || {
-        signal.store(true, Ordering::SeqCst);
-    })
-    .map_err(|error| AppError::local(format!("could not install Ctrl-C handler: {error}")))?;
+    let canceled = config.canceled.clone();
     let (sender, receiver) = mpsc::channel();
     let started = Instant::now();
     let mut workers = Vec::with_capacity(concurrency);
@@ -740,13 +791,14 @@ fn run_suite(mut config: Config) -> Result<u8, AppError> {
 fn execute_suite_endpoint(config: &Config) -> Result<BatchResult, AppError> {
     cli::validate_curl_args(&config.curl_args)?;
     let slo = config.slo.as_deref().map(parse_slo).transpose()?;
-    let expectations = Expectations::parse(
+    let expectations = Expectations::parse_with_json(
         &config.expect_status,
         &config.expect_header,
         config.min_body_bytes,
         config.max_body_bytes,
         &config.expect_body_contains,
         &config.expect_body_regex,
+        &config.expect_json,
     )?;
     let baseline = config.compare.as_deref().map(load_baseline).transpose()?;
     let regression_rules = parse_rules(&config.fail_if, baseline.is_some())?;
@@ -759,9 +811,138 @@ fn execute_suite_endpoint(config: &Config) -> Result<BatchResult, AppError> {
     )
 }
 
+fn stopped(config: &Config) -> bool {
+    config.canceled.load(Ordering::SeqCst)
+        || config
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn interruptible_delay(config: &Config, delay: Duration) {
+    let started = Instant::now();
+    while !stopped(config) && started.elapsed() < delay {
+        thread::sleep(
+            delay
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+fn validate_endpoint(config: &Config) -> Result<(), AppError> {
+    let url = url::Url::parse(&config.url)
+        .map_err(|_| AppError::local("endpoint URL must be an absolute HTTP(S) URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::local(
+            "only HTTP and HTTPS endpoints are supported",
+        ));
+    }
+    cli::validate_curl_args(&config.curl_args)?;
+    if let Some(slo) = &config.slo {
+        parse_slo(slo)?;
+    }
+    Expectations::parse_with_json(
+        &config.expect_status,
+        &config.expect_header,
+        config.min_body_bytes,
+        config.max_body_bytes,
+        &config.expect_body_contains,
+        &config.expect_body_regex,
+        &config.expect_json,
+    )?;
+    if let Some(path) = &config.compare {
+        load_baseline(path)?;
+    }
+    parse_rules(&config.fail_if, config.compare.is_some())?;
+    Ok(())
+}
+
+fn doctor(curl_bin: &str) -> Result<(), AppError> {
+    let curl = runner::validate_installation(curl_bin)?;
+    println!(
+        "httpstatr {} ({}/{})",
+        env!("CARGO_PKG_VERSION"),
+        env::consts::OS,
+        env::consts::ARCH
+    );
+    println!("curl {}: HTTP supported", curl.version);
+    println!("curl configuration: implicit curlrc disabled; each sample starts a new process");
+    let temporary = tempfile::NamedTempFile::new()
+        .map_err(|e| AppError::local(format!("temporary directory is not writable: {e}")))?;
+    drop(temporary);
+    println!("temporary directory: writable");
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        if env::var_os(variable).is_some() {
+            println!("{variable}: configured (value hidden)");
+        }
+    }
+    for variable in ["CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        if let Some(path) = env::var_os(variable) {
+            if !std::path::Path::new(&path).exists() {
+                return Err(AppError::local(format!(
+                    "{variable} points to a missing path"
+                )));
+            }
+            println!("{variable}: path exists (certificate trust not tested)");
+        }
+    }
+    println!("No remote requests were made. Use --save PATH to check a specific output location.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_terminates_active_request_and_preserves_completed_samples() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request);
+                if index == 1 {
+                    sender.send(()).unwrap();
+                    thread::sleep(Duration::from_secs(1));
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let Action::Run(config) = cli::parse(vec![url, "--repeat=4".into()]).unwrap() else {
+            panic!("expected run");
+        };
+        let signal = config.canceled.clone();
+        let cancel = thread::spawn(move || {
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            signal.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = execute_batch(&config, None, None, None, &[]).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert_eq!(result.exit_code, 130);
+        assert_eq!(result.summary.transport_successful, 1);
+        assert_eq!(result.samples.len(), 4);
+        assert_eq!(result.samples[1].exit_code, 130);
+        cancel.join().unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn rejects_oversized_body_before_reading_it() {

@@ -2,6 +2,14 @@ use crate::model::{BatchResult, Diagnostic, Statistics};
 
 pub fn analyze(result: &BatchResult) -> Vec<Diagnostic> {
     let mut found = Vec::new();
+    if result.aggregate.total.count > 0 && result.aggregate.total.count < 100 {
+        found.push(Diagnostic {
+            code: "small_tail_sample".into(), level: "info".into(),
+            observation: "Tail percentiles are based on fewer than 100 successful samples".into(),
+            evidence: format!("{} successful timing samples; p99 may equal the maximum", result.aggregate.total.count),
+            suggestion: "Collect more samples under comparable conditions; this warning does not change policy results.".into(),
+        });
+    }
     let total = result.aggregate.total.median;
     if total <= 0.0 {
         return found;

@@ -5,6 +5,55 @@ document. Suite schema version `1` supports shared request defaults, endpoint
 overrides, bounded concurrency, endpoint-level checks, and suite-level pass
 policies.
 
+Validate the entire suite before sending requests:
+
+```console
+httpstatr --file endpoints.toml --validate
+```
+
+Validation checks endpoint URLs, assertions, regexes, baselines, regression
+rules, concurrency, and limits without requiring curl. Execution performs the
+same preflight validation before starting any endpoint.
+
+## Environment profiles and secrets
+
+Use named profiles for ordinary variables and explicit environment references
+for credentials:
+
+```toml
+schema_version = 1
+
+[profiles.staging]
+BASE_URL = "https://staging.example.com"
+
+[profiles.production]
+BASE_URL = "https://api.example.com"
+
+[[requests]]
+name = "health"
+url = "${BASE_URL}/health"
+headers = ["Authorization: Bearer ${env:API_TOKEN}"]
+expect_status = ["200"]
+expect_json = ['/status="healthy"']
+```
+
+```console
+httpstatr --file endpoints.toml --profile staging --validate
+httpstatr --file endpoints.toml --profile staging --run-timeout 120
+```
+
+Set `API_TOKEN` through your shell or CI secret store. Missing variables fail
+before requests start. Substitution occurs after TOML parsing, so values cannot
+inject additional configuration. Environment values are inserted literally;
+profile variables may refer to other profile variables, with a nesting limit.
+Substitution applies to request URLs, methods, bodies, headers, assertions,
+SLOs, regression rules, and curl arguments. Numeric settings and file paths
+remain literal TOML values. Credential arguments remain redacted in reports.
+
+Suite files are limited to 4 MiB, 256 endpoints, and 100,000 measured plus
+warmup requests combined. Use `--run-timeout` for a whole-suite deadline and
+`--max-download-bytes` for the response download limit shared by its endpoints.
+
 Suites are useful for integration smoke tests, deployment verification, and
 service-level contract checks. They keep request definitions and pass criteria
 in version control, while JUnit, Markdown, and JSON output make the same suite

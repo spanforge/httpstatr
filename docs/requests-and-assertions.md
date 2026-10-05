@@ -79,6 +79,28 @@ httpstatr https://api.example.com \
 ```
 
 Every repeated header assertion must pass.
+When a response contains the same header more than once, a value assertion
+passes if any individual value matches. Header maps preserve those values
+separated by newlines.
+
+## JSON assertions
+
+`--expect-json` accepts a JSON Pointer and a JSON value separated by `=`.
+Use `:type` before `=` to assert a type:
+
+```console
+httpstatr https://api.example.com/health --expect-json '/status="healthy"'
+httpstatr https://api.example.com/health --expect-json '/ok=true'
+httpstatr https://api.example.com/items --expect-json '/items:type=array'
+```
+
+Types are `null`, `boolean`, `number`, `string`, `array`, and `object`.
+An empty pointer selects the whole document; `/items/0` selects an array item.
+Use `~0` for a literal tilde and `~1` for a literal slash in a field name.
+Every assertion must pass. Invalid JSON, missing fields, and mismatched values
+or types return assertion exit code 5. Failure reports identify the pointer
+without printing the expected or observed JSON value. The same syntax works
+in suite `expect_json` arrays. JSON assertions use the 16 MiB body-content limit.
 
 ## Body assertions
 

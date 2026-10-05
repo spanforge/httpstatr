@@ -9,25 +9,35 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Verify release source and dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+      - run: cargo package --locked
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   build:
+    needs: verify
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -44,15 +54,8 @@ jobs:
           test "${GITHUB_REF_NAME}" = "v${package_version}"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package Unix binary
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          name="httpstatr-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/httpstatr" "dist/${name}/"
-          cp README.md CHANGELOG.md SECURITY.md LICENSE NOTICE "dist/${name}/"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+      - name: Test on supported operating system
+        run: cargo test --all-targets --locked
       - name: Package Windows binary
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -61,19 +64,32 @@ jobs:
           New-Item -ItemType Directory -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/httpstatr.exe" "dist/$name/"
           Copy-Item README.md,CHANGELOG.md,SECURITY.md,LICENSE,NOTICE "dist/$name/"
+          Copy-Item docs,examples "dist/$name/" -Recurse
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Copy-Item "dist/$name/httpstatr.exe" "dist/httpstatr.exe"
+          Expand-Archive -Path "dist/$name.zip" -DestinationPath smoke
+          & "smoke/$name/httpstatr.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "Packaged executable failed" }
+          & "smoke/$name/httpstatr.exe" doctor
+          if ($LASTEXITCODE -ne 0) { throw "Packaged runtime check failed" }
+          & "smoke/$name/httpstatr.exe" --file examples/httpstatr-suite.toml --validate
+          if ($LASTEXITCODE -ne 0) { throw "Packaged suite validation failed" }
       - uses: actions/upload-artifact@v4
         with:
           name: httpstatr-${{ matrix.target }}
-          path: dist/*.${{ matrix.archive }}
+          path: |
+            dist/*.${{ matrix.archive }}
+            dist/*.exe
           if-no-files-found: error
 
   publish:
-    name: Publish GitHub prerelease
+    name: Publish GitHub release
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -82,11 +98,19 @@ jobs:
           merge-multiple: true
       - name: Create checksums
         working-directory: dist
-        run: sha256sum *.tar.gz *.zip > SHA256SUMS
+        run: sha256sum *.zip *.exe > SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME" dist/*
-          --verify-tag --prerelease --generate-notes
-          --title "httpstatr ${GITHUB_REF_NAME#v}"
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --generate-notes "${flags[@]}" \
+            --title "httpstatr ${GITHUB_REF_NAME#v}"
